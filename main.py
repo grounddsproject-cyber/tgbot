@@ -1,20 +1,19 @@
 import asyncio
-import json
 import os
 import logging
+import asyncpg
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.session.aiohttp import AiohttpSession
 
-# ==================== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ====================
+# ==================== НАСТРОЙКИ ====================
 TOKEN_TELEGRAM = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_TOKEN")
 ADMIN_TG_ID = int(os.getenv("ADMIN_TG_ID", "123456789"))
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:password@db.xxx.supabase.co:5432/postgres")
 
-# ==================== КОНСТАНТЫ ====================
 SERVERS = ["The bruh Land", "Пивные дали", "Движуха"]
 
 STATUS_NAMES = {
@@ -25,40 +24,46 @@ STATUS_NAMES = {
     5: "Неизвестно",
 }
 
-STATUS_FILE = "statuses.json"
-REPORTS_FILE = "reports.json"
-
-# ==================== ХРАНИЛИЩЕ ====================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_json(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return default
-    return default
+# ==================== БАЗА ДАННЫХ ====================
+db_pool = None
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    logging.info("Подключение к БД установлено")
 
-# Инициализация статусов
-statuses = load_json(STATUS_FILE, {s: {"status": 5, "note": ""} for s in SERVERS})
-for s in SERVERS:
-    if s not in statuses:
-        statuses[s] = {"status": 5, "note": ""}
-save_json(STATUS_FILE, statuses)
+async def get_server(server_name):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT status, note FROM servers WHERE name = $1", server_name)
+        return dict(row) if row else {"status": 5, "note": ""}
+
+async def get_all_servers():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT name, status, note FROM servers ORDER BY id")
+        return [dict(r) for r in rows]
+
+async def set_status(server_name, status):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE servers SET status = $1 WHERE name = $2", status, server_name)
+
+async def set_note(server_name, note):
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE servers SET note = $1 WHERE name = $2", note, server_name)
+
+async def get_unread_reports():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, user_name, guild_name, created_at FROM reports WHERE is_read = FALSE ORDER BY id")
+        return [dict(r) for r in rows]
+
+async def mark_reports_read(ids):
+    if not ids:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE reports SET is_read = TRUE WHERE id = ANY($1::int[])", ids)
 
 # ==================== TELEGRAM BOT ====================
-# Если на хостинге будет ошибка подключения к Telegram, раскомментируй строки ниже
-# и вставь свой прокси (можно взять на proxy6.net или proxy.sale)
-
-# proxy_url = "http://login:password@ip:port"  # Замени на свои данные!
-# session = AiohttpSession(proxy=proxy_url)
-# bot = Bot(token=TOKEN_TELEGRAM, session=session)
-
 bot = Bot(token=TOKEN_TELEGRAM)
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -68,59 +73,59 @@ class NoteStates(StatesGroup):
 
 
 async def build_main_menu():
-    """Главное меню с выбором сервера"""
+    servers = await get_all_servers()
     buttons = []
-    for server in SERVERS:
-        data = statuses.get(server, {"status": 5})
-        status_name = STATUS_NAMES.get(data["status"], "Неизвестно")
+    for s in servers:
+        status_name = STATUS_NAMES.get(s["status"], "Неизвестно")
         buttons.append([InlineKeyboardButton(
-            text=f"{server} [{status_name}]",
-            callback_data=f"srv:{server}"
+            text=f"{s['name']} [{status_name}]",
+            callback_data=f"srv:{s['name']}"
         )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def build_server_menu(server: str):
-    """Меню управления конкретным сервером"""
-    data = statuses.get(server, {"status": 5, "note": ""})
+async def build_server_menu(server_name: str):
+    data = await get_server(server_name)
     buttons = []
     for code, name in STATUS_NAMES.items():
         mark = "✅ " if code == data["status"] else ""
         buttons.append([InlineKeyboardButton(
             text=f"{mark}{name}",
-            callback_data=f"set:{server}:{code}"
+            callback_data=f"set:{server_name}:{code}"
         )])
     buttons.append([InlineKeyboardButton(
         text="📝 Изменить заметку" if data.get("note") else "📝 Добавить заметку",
-        callback_data=f"note:{server}"
+        callback_data=f"note:{server_name}"
     )])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back:main")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def check_reports():
-    """Периодически проверяет новые жалобы из reports.json"""
-    last_report_count = len(load_json(REPORTS_FILE, []))
+    """Проверяет новые жалобы каждые 5 секунд"""
+    await asyncio.sleep(3)  # Даём время на инициализацию
     
     while True:
-        await asyncio.sleep(5)
         try:
-            reports = load_json(REPORTS_FILE, [])
-            if len(reports) > last_report_count:
-                new_reports = reports[last_report_count:]
-                for report in new_reports:
+            reports = await get_unread_reports()
+            if reports:
+                ids = []
+                for r in reports:
                     await bot.send_message(
                         ADMIN_TG_ID,
-                        f"🚨 <b>Поступила жалоба на подключение!</b>\n\n"
-                        f"Пользователь: <b>{report['user']}</b>\n"
-                        f"Сервер Discord: <b>{report['guild']}</b>\n"
-                        f"Время: {report['time']}",
+                        f"🚨 <b>Жалоба на подключение!</b>\n\n"
+                        f"Пользователь: <b>{r['user_name']}</b>\n"
+                        f"Сервер: <b>{r['guild_name']}</b>\n"
+                        f"Время: {r['created_at'].strftime('%d.%m.%Y %H:%M:%S')}",
                         parse_mode="HTML"
                     )
-                last_report_count = len(reports)
-                logging.info(f"Отправлено {len(new_reports)} новых жалоб")
+                    ids.append(r["id"])
+                await mark_reports_read(ids)
+                logging.info(f"Отправлено {len(reports)} жалоб")
         except Exception as e:
             logging.error(f"Ошибка проверки жалоб: {e}")
+        
+        await asyncio.sleep(5)
 
 
 @dp.message(CommandStart())
@@ -129,8 +134,7 @@ async def start_handler(message: Message):
         await message.answer("⛔ Доступ запрещён.")
         return
     await message.answer(
-        "👋 <b>Панель управления серверами</b>\n\n"
-        "Выберите сервер для управления:",
+        "👋 <b>Панель управления серверами</b>\n\nВыберите сервер:",
         reply_markup=await build_main_menu(),
         parse_mode="HTML"
     )
@@ -141,13 +145,13 @@ async def callback_handler(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_TG_ID:
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-
+    
     data = callback.data
 
     if data == "back:main":
         await state.clear()
         await callback.message.edit_text(
-            "👋 <b>Панель управления серверами</b>\n\nВыберите сервер:",
+            "👋 <b>Панель управления</b>\n\nВыберите сервер:",
             reply_markup=await build_main_menu(),
             parse_mode="HTML"
         )
@@ -155,11 +159,11 @@ async def callback_handler(callback: CallbackQuery, state: FSMContext):
 
     elif data.startswith("srv:"):
         server = data[4:]
-        server_data = statuses.get(server, {"status": 5, "note": ""})
+        s_data = await get_server(server)
         await callback.message.edit_text(
             f"🖥 <b>{server}</b>\n\n"
-            f"Текущий статус: <b>{STATUS_NAMES.get(server_data['status'], 'Неизвестно')}</b>\n"
-            f"Заметка: <i>{server_data.get('note') or '—'}</i>\n\n"
+            f"Статус: <b>{STATUS_NAMES.get(s_data['status'], 'Неизвестно')}</b>\n"
+            f"Заметка: <i>{s_data.get('note') or '—'}</i>\n\n"
             "Выберите новый статус:",
             reply_markup=await build_server_menu(server),
             parse_mode="HTML"
@@ -169,14 +173,12 @@ async def callback_handler(callback: CallbackQuery, state: FSMContext):
     elif data.startswith("set:"):
         _, server, code = data.split(":")
         code = int(code)
-        statuses[server]["status"] = code
-        save_json(STATUS_FILE, statuses)
-        
-        server_data = statuses.get(server, {"status": 5, "note": ""})
+        await set_status(server, code)
+        s_data = await get_server(server)
         await callback.message.edit_text(
             f"🖥 <b>{server}</b>\n\n"
-            f"Текущий статус: <b>{STATUS_NAMES.get(code, 'Неизвестно')}</b>\n"
-            f"Заметка: <i>{server_data.get('note') or '—'}</i>\n\n"
+            f"Статус: <b>{STATUS_NAMES.get(code, 'Неизвестно')}</b>\n"
+            f"Заметка: <i>{s_data.get('note') or '—'}</i>\n\n"
             "Выберите новый статус:",
             reply_markup=await build_server_menu(server),
             parse_mode="HTML"
@@ -206,11 +208,8 @@ async def note_handler(message: Message, state: FSMContext):
         return
 
     text = message.text.strip()
-    if text == "-":
-        statuses[server]["note"] = ""
-    else:
-        statuses[server]["note"] = text
-    save_json(STATUS_FILE, statuses)
+    note = "" if text == "-" else text
+    await set_note(server, note)
     await state.clear()
 
     await message.answer(
@@ -221,10 +220,8 @@ async def note_handler(message: Message, state: FSMContext):
 
 
 async def main():
-    # Запускаем проверку жалоб в фоне
+    await init_db()
     asyncio.create_task(check_reports())
-    
-    # Запускаем бота
     logging.info("Telegram бот запускается...")
     await dp.start_polling(bot)
 
